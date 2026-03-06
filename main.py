@@ -2,8 +2,10 @@ import os
 import io
 import datetime
 import numpy as np
+import pandas as pd
 import osmnx as ox
 import rasterio
+from rasterio import features
 from rasterio.mask import mask
 from sklearn.cluster import KMeans
 import folium
@@ -33,6 +35,11 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
     Download a median composite of Sentinel-2 surface reflectance
     for the given boundary using SentinelHub.
     """
+    output_filename = "sentinel_median.tif"
+    if os.path.exists(output_filename):
+        print(f"Found existing {output_filename}, skipping download.")
+        return output_filename
+
     import rasterio.transform
 
     config = SHConfig()
@@ -112,8 +119,6 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
         
     image_array = data[0] # The median composite
     
-    # Output to TIF
-    output_filename = "sentinel_median.tif"
     print(f"Saving downloaded image to {output_filename}... dimensions: {image_array.shape}")
     
     # SH Request returns array usually (H, W, Bands)
@@ -232,9 +237,6 @@ def generate_cluster_map(cluster_image, profile, boundary_gdf):
     colors = ['#fde725', '#5dc863', '#21908c', '#3b528b', '#440154'] # Viridis colors for distinct clusters
     cmap = ListedColormap(colors)
     
-    # Save the cluster array as a temporary PNG or TIF for mapping, but we can plot straight to folium
-    # using ImageOverlay if we colorize it to RGBA
-    
     # Mask out the -1 values with transparency
     h, w = cluster_image.shape
     rgba_image = np.zeros((h, w, 4), dtype=np.uint8)
@@ -253,13 +255,9 @@ def generate_cluster_map(cluster_image, profile, boundary_gdf):
     
     # Get bounds
     bounds = rasterio.transform.array_bounds(profile['height'], profile['width'], profile['transform'])
-    # Output is (minx, miny, maxx, maxy) in EPSG:4326 usually since we download that way, let's verify
     if profile['crs'] and profile['crs'].to_epsg() != 4326:
-        # If the image was downloaded in another CRS, we need to handle it.
-        # But ee_export_image defaults to 4326 if not specified (or native CRS).
         pass
 
-    # Bounds for folium ImageOverlay: [[lat_min, lon_min], [lat_max, lon_max]]
     lat_min = bounds[1]
     lat_max = bounds[3]
     lon_min = bounds[0]
@@ -267,7 +265,6 @@ def generate_cluster_map(cluster_image, profile, boundary_gdf):
     
     image_bounds = [[lat_min, lon_min], [lat_max, lon_max]]
     
-    # Create folium map centered on the image
     center_lat = (lat_min + lat_max) / 2
     center_lon = (lon_min + lon_max) / 2
     m = folium.Map(location=[center_lat, center_lon], zoom_start=10)
@@ -312,6 +309,191 @@ def generate_cluster_map(cluster_image, profile, boundary_gdf):
     m.save("map.html")
     print("Map generated successfully at map.html!")
 
+def load_official_forest_map(shapefile_path):
+    print(f"Loading official forest map from {shapefile_path}...")
+    if not os.path.exists(shapefile_path):
+        print(f"WARNING: Official forest map not found at {shapefile_path}. Skipping validation.")
+        return None
+    gdf = gpd.read_file(shapefile_path)
+    if gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+    return gdf
+
+def clip_forest_map_to_boundary(forest_gdf, boundary_geom):
+    print("Clipping forest map to boundary...")
+    boundary_gdf = gpd.GeoDataFrame(geometry=[boundary_geom], crs="EPSG:4326")
+    clipped = gpd.overlay(forest_gdf, boundary_gdf, how="intersection")
+    return clipped
+
+def calculate_cluster_overlap(cluster_image, profile, forest_gdf):
+    print("Calculating cluster vs forest type overlap...")
+    
+    type_col = None
+    for col in ['ForestType', 'type', 'Type', 'class', 'CLASS', 'Desc', 'DESC']:
+        if col in forest_gdf.columns:
+            type_col = col
+            break
+    if type_col is None and len(forest_gdf.columns) > 1:
+        type_col = [c for c in forest_gdf.columns if c != 'geometry'][0]
+    
+    unique_types = forest_gdf[type_col].unique() if type_col else ["Forest"]
+    type_to_id = {t: i+1 for i, t in enumerate(unique_types)}
+    id_to_type = {i+1: t for i, t in enumerate(unique_types)}
+    id_to_type[0] = "Unknown/Outside"
+    
+    shapes = ((geom, type_to_id[typ] if type_col else 1) for geom, typ in zip(forest_gdf.geometry, forest_gdf[type_col] if type_col else ["Forest"] * len(forest_gdf)))
+    
+    h, w = cluster_image.shape
+    forest_raster = features.rasterize(
+        shapes=shapes,
+        out_shape=(h, w),
+        transform=profile['transform'],
+        fill=0,
+        dtype=np.uint8
+    )
+    
+    stats = []
+    for c_id in range(5):
+        mask = cluster_image == c_id
+        cluster_pixels = np.sum(mask)
+        if cluster_pixels == 0:
+            continue
+            
+        overlap = forest_raster[mask]
+        unique, counts = np.unique(overlap, return_counts=True)
+        overlap_dict = dict(zip(unique, counts))
+        
+        best_type_id = None
+        best_count = -1
+        for tid, cnt in overlap_dict.items():
+            if tid != 0 and cnt > best_count:
+                best_count = cnt
+                best_type_id = tid
+                
+        if best_type_id is not None:
+            dominant_type = id_to_type[best_type_id]
+            percentage = (best_count / cluster_pixels) * 100
+        else:
+            dominant_type = "None"
+            percentage = 0.0
+            
+        stats.append({
+            "Cluster": c_id,
+            "Dominant Forest Type": dominant_type,
+            "Overlap Percentage": f"{percentage:.1f}%"
+        })
+        
+    df = pd.DataFrame(stats)
+    print("")
+    print("--- Validation Statistics ---")
+    print(df.to_string(index=False))
+    print("-----------------------------")
+    print("")
+    return df
+
+def generate_validation_map(cluster_image, profile, forest_gdf, boundary_gdf):
+    print("Generating validation map with folium...")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+    
+    colors = ['#fde725', '#5dc863', '#21908c', '#3b528b', '#440154']
+    h, w = cluster_image.shape
+    rgba_image = np.zeros((h, w, 4), dtype=np.uint8)
+    
+    for i in range(5):
+        mask = cluster_image == i
+        hex_color = colors[i]
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        rgba_image[mask, 0] = r
+        rgba_image[mask, 1] = g
+        rgba_image[mask, 2] = b
+        rgba_image[mask, 3] = 255
+    
+    bounds = rasterio.transform.array_bounds(profile['height'], profile['width'], profile['transform'])
+    lat_min = bounds[1]
+    lat_max = bounds[3]
+    lon_min = bounds[0]
+    lon_max = bounds[2]
+    
+    image_bounds = [[lat_min, lon_min], [lat_max, lon_max]]
+    center_lat = (lat_min + lat_max) / 2
+    center_lon = (lon_min + lon_max) / 2
+    
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=10)
+    
+    # Official forest layers
+    type_col = None
+    if forest_gdf is not None:
+        for col in ['ForestType', 'type', 'Type', 'class', 'CLASS', 'Desc', 'DESC']:
+            if col in forest_gdf.columns:
+                type_col = col
+                break
+        if type_col is None and len(forest_gdf.columns) > 1:
+            type_col = [c for c in forest_gdf.columns if c != 'geometry'][0]
+
+        fg_forest = folium.FeatureGroup(name='Official Forest Types')
+        
+        for _, row in forest_gdf.iterrows():
+            tooltip_text = f"Type: {row[type_col]}" if type_col else "Forest Polygon"
+            folium.GeoJson(
+                row.geometry,
+                style_function=lambda x: {'fillColor': 'blue', 'color': 'black', 'weight': 1, 'fillOpacity': 0.4},
+                tooltip=tooltip_text
+            ).add_to(fg_forest)
+            
+        fg_forest.add_to(m)
+
+    # Cluster layer
+    fg_clusters = folium.FeatureGroup(name='Vegetation Clusters', show=True)
+    folium.raster_layers.ImageOverlay(
+        image=rgba_image,
+        bounds=image_bounds,
+        opacity=0.7,
+        name='Vegetation Clusters',
+        interactive=True,
+        cross_origin=False
+    ).add_to(fg_clusters)
+    fg_clusters.add_to(m)
+    
+    # Boundary
+    folium.GeoJson(
+        boundary_gdf,
+        name="District Boundary",
+        style_function=lambda x: {'fillColor': 'transparent', 'color': 'red', 'weight': 2}
+    ).add_to(m)
+    
+    # Legend
+    legend_html = '''
+     <div style="position: fixed; 
+     bottom: 50px; left: 50px; width: 120px; height: 160px; 
+     border:2px solid grey; z-index:9999; font-size:14px;
+     background-color:white;
+     padding: 10px;
+     ">
+     <b>Clusters</b><br>
+     <i style="background:#fde725;width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 0<br>
+     <i style="background:#5dc863;width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 1<br>
+     <i style="background:#21908c;width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 2<br>
+     <i style="background:#3b528b;width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 3<br>
+     <i style="background:#440154;width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 4<br>
+     </div>
+     '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+    
+    folium.LayerControl().add_to(m)
+    return m
+
+def export_results(stats_df, map_obj):
+    print("Exporting validation results...")
+    if stats_df is not None:
+        stats_df.to_csv("cluster_overlap_stats.csv", index=False)
+        print("Saved cluster_overlap_stats.csv")
+    if map_obj is not None:
+        map_obj.save("validation_map.html")
+        print("Saved validation_map.html")
+
 def main():
     district = "Dang"
     country = "India"
@@ -335,8 +517,20 @@ def main():
     # 6. Clustering
     cluster_image = run_clustering(valid_features, valid_mask, shape)
     
-    # 7. Map generation
+    # 7. Map generation (Original)
     generate_cluster_map(cluster_image, profile, gdf)
+    
+    # --- VALIDATION PIPELINE ---
+    shapefile_path = "data/forest_type.shp" # Please update this path
+    forest_gdf = load_official_forest_map(shapefile_path)
+    
+    if forest_gdf is not None:
+        forest_gdf_clipped = clip_forest_map_to_boundary(forest_gdf, geom)
+        stats_df = calculate_cluster_overlap(cluster_image, profile, forest_gdf_clipped)
+        val_map = generate_validation_map(cluster_image, profile, forest_gdf_clipped, gdf)
+        export_results(stats_df, val_map)
+    else:
+        print("Validation pipeline skipped. Please provide a valid shapefile path.")
 
 if __name__ == "__main__":
     main()
