@@ -10,11 +10,10 @@ import rasterio
 from rasterio import features
 from rasterio.warp import reproject, Resampling
 from rasterio.mask import mask
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 from shapely.geometry import mapping, box
 import geopandas as gpd
 
-import ee
 import requests
 import zipfile
 
@@ -44,20 +43,21 @@ def array_to_base64_png(rgba_array):
 
 def get_boundary(district, country):
     place_query = f"{district}, {country}"
-    print(f"Fetching boundary for {place_query}...")
+    print(f"Fetching boundary for {place_query}...", flush=True)
     try:
         gdf = ox.geocode_to_gdf(place_query)
         geom = gdf.iloc[0].geometry
         return geom, gdf
     except Exception as e:
-        print(f"Error fetching boundary: {e}")
+        print(f"Error fetching boundary: {e}", flush=True)
         raise
 
 def download_sentinel(boundary_geom, district, country, client_id=None, client_secret=None):
     safe_name = f"{district.replace(' ', '_')}_{country.replace(' ', '_')}".lower()
     output_filename = f"sentinel_median_{safe_name}.tif"
+    print(f"Checking for existing Sentinel-2 image at {output_filename}...", flush=True)
     if os.path.exists(output_filename):
-        print(f"Found existing {output_filename}, skipping download.")
+        print(f"Found existing {output_filename}, skipping download.", flush=True)
         return output_filename
 
     import rasterio.transform
@@ -67,7 +67,7 @@ def download_sentinel(boundary_geom, district, country, client_id=None, client_s
         config.sh_client_id = client_id
         config.sh_client_secret = client_secret
     
-    print("Fetching Sentinel-2 median composite from SentinelHub...")
+    print("Fetching Sentinel-2 median composite from SentinelHub...", flush=True)
     
     minx, miny, maxx, maxy = boundary_geom.bounds
     bbox = BBox(bbox=[minx, miny, maxx, maxy], crs=CRS.WGS84)
@@ -96,15 +96,16 @@ def download_sentinel(boundary_geom, district, country, client_id=None, client_s
     }
     """
     
-    size_x, size_y = bbox_to_dimensions(bbox, resolution=10)
+    size_x, size_y = bbox_to_dimensions(bbox, resolution=20)
     
-    if size_x > 1000:
-        ratio = 1000 / size_x
-        size_x = 1000
+    # Cap dimensions to 512 to vastly improve performance
+    if size_x > 512:
+        ratio = 512 / size_x
+        size_x = 512
         size_y = int(size_y * ratio)
-    if size_y > 1000:
-        ratio = 1000 / size_y
-        size_y = 1000
+    if size_y > 512:
+        ratio = 512 / size_y
+        size_y = 512
         size_x = int(size_x * ratio)
 
     request_sh = SentinelHubRequest(
@@ -132,7 +133,7 @@ def download_sentinel(boundary_geom, district, country, client_id=None, client_s
         
     image_array = data[0]
     
-    print(f"Saving downloaded image to {output_filename}... dimensions: {image_array.shape}")
+    print(f"Saving downloaded image to {output_filename}... dimensions: {image_array.shape}", flush=True)
     
     bands = image_array.shape[-1]
     height = image_array.shape[0]
@@ -160,7 +161,7 @@ def download_sentinel(boundary_geom, district, country, client_id=None, client_s
     return output_filename
 
 def read_bands(image_path):
-    print(f"Reading spectral bands from {image_path}...")
+    print(f"Reading spectral bands from {image_path}...", flush=True)
     with rasterio.open(image_path) as src:
         bands = src.read()
         profile = src.profile
@@ -177,22 +178,23 @@ def read_bands(image_path):
     return b2, b3, b4, b5, b6, b7, b8, b11, profile
 
 def compute_ndvi(b4, b8):
-    print("Computing NDVI...")
+    print("Computing NDVI...", flush=True)
     np.seterr(divide='ignore', invalid='ignore')
     ndvi = np.where((b8 + b4) == 0., 0, (b8 - b4) / (b8 + b4))
     return ndvi
 
 def compute_ndwi(b3, b8):
+    print("Computing NDWI...", flush=True)
     np.seterr(divide='ignore', invalid='ignore')
     ndwi = np.where((b3 + b8) == 0., 0, (b3 - b8) / (b3 + b8))
     return ndwi
 
 def compute_red_edge_index(b5, b6, b7):
-    print("Computing Red-Edge Vegetation Index...")
+    print("Computing Red-Edge Vegetation Index...", flush=True)
     return (b5 + b6 + b7) / 3.0
 
 def prepare_features(b2, b3, b4, b8, b11, ndvi, ndwi):
-    print("Preparing feature stack for clustering...")
+    print("Preparing feature stack for clustering...", flush=True)
     shape = b2.shape
     
     b2_flat = b2.flatten()
@@ -211,8 +213,8 @@ def prepare_features(b2, b3, b4, b8, b11, ndvi, ndwi):
     return valid_features, valid_mask, shape
 
 def run_clustering(valid_features, valid_mask, shape):
-    print("Running KMeans clustering (k=5)...")
-    kmeans = KMeans(n_clusters=5, random_state=42, n_init="auto")
+    print("Running MiniBatchKMeans clustering (k=5)...", flush=True)
+    kmeans = MiniBatchKMeans(n_clusters=5, random_state=42, n_init=3, batch_size=2048)
     
     cluster_labels_valid = kmeans.fit_predict(valid_features)
     
@@ -223,7 +225,7 @@ def run_clustering(valid_features, valid_mask, shape):
     return cluster_image
 
 def calculate_cluster_statistics(cluster_image, ndvi, red_edge):
-    print("Calculating cluster statistics...")
+    print("Calculating cluster statistics...", flush=True)
     stats = []
     # Pixel area = 10m * 10m = 100 m^2 = 0.0001 km^2
     pixel_area_km2 = 0.0001
@@ -258,7 +260,7 @@ def calculate_cluster_statistics(cluster_image, ndvi, red_edge):
     return df
 
 def assign_cluster_labels(cluster_stats):
-    print("Assigning cluster labels based on spectral evidence...")
+    print("Assigning cluster labels based on spectral evidence...", flush=True)
     cluster_labels = {}
     assigned_types = []
     
@@ -284,135 +286,14 @@ def assign_cluster_labels(cluster_stats):
         
     cluster_stats["Assigned Vegetation Type"] = assigned_types
     
+    print("\n--- Spectral Clustering Results ---", flush=True)
+    print(cluster_stats[["Cluster", "Mean NDVI", "Mean RedEdge", "Assigned Vegetation Type"]].to_string(index=False), flush=True)
+    print("-----------------------------------\n", flush=True)
+    
     return cluster_labels, cluster_stats
 
-def download_esa_worldcover(boundary_geom, district, country, ee_project=None):
-    print("Initializing Earth Engine...")
-    try:
-        if ee_project:
-            ee.Initialize(project=ee_project)
-        else:
-            ee.Initialize()
-    except Exception as e:
-        print(f"Earth Engine not initialized: {e}")
-        raise
-
-
-    safe_name = f"{district.replace(' ', '_')}_{country.replace(' ', '_')}".lower()
-    output_filename = f"worldcover_reference_{safe_name}.tif"
-    if os.path.exists(output_filename):
-        print(f"Found existing {output_filename}, skipping download.")
-        return output_filename
-        
-    print("Downloading ESA WorldCover from Earth Engine...")
-    minx, miny, maxx, maxy = boundary_geom.bounds
-    region = ee.Geometry.BBox(minx, miny, maxx, maxy)
-    
-    dataset = ee.ImageCollection("ESA/WorldCover/v100").first()
-    image = dataset.select('Map').clip(region)
-    
-    url = image.getDownloadURL({
-        'dimensions': 2000,
-        'region': region,
-        'format': 'GEO_TIFF',
-        'crs': 'EPSG:4326',
-        'maxPixels': 1e9
-    })
-    
-    response = requests.get(url)
-    if response.status_code != 200:
-        raise Exception(f"Failed to download from EE: {response.text}")
-        
-    try:
-        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-            tif_name = [n for n in z.namelist() if n.endswith('.tif')][0]
-            with open(output_filename, 'wb') as f:
-                f.write(z.read(tif_name))
-    except zipfile.BadZipFile:
-        with open(output_filename, 'wb') as f:
-            f.write(response.content)
-            
-    print(f"Saved WorldCover to {output_filename}")
-    return output_filename
-
-def process_worldcover_raster(worldcover_path, target_profile):
-    print("Resampling WorldCover raster to match cluster resolution...")
-    resampled_data = np.zeros((target_profile['height'], target_profile['width']), dtype=np.uint8)
-    
-    with rasterio.open(worldcover_path) as src:
-        reproject(
-            source=rasterio.band(src, 1),
-            destination=resampled_data,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=target_profile['transform'],
-            dst_crs=target_profile['crs'],
-            resampling=Resampling.nearest
-        )
-        
-    return resampled_data
-
-def calculate_cluster_overlap(cluster_image, worldcover_image):
-    print("Calculating cluster vs WorldCover overlap...")
-    
-    class_mapping = {
-        10: "Tree Cover",
-        20: "Shrubland",
-        30: "Grassland"
-    }
-    
-    stats = []
-    
-    for c_id in range(5):
-        mask = cluster_image == c_id
-        cluster_pixels = np.sum(mask)
-        if cluster_pixels == 0:
-            continue
-            
-        wc_pixels = worldcover_image[mask]
-        
-        unique, counts = np.unique(wc_pixels, return_counts=True)
-        overlap_dict = dict(zip(unique, counts))
-        
-        best_class = None
-        best_count = -1
-        
-        vegetation_found = False
-        for wc_class, cnt in overlap_dict.items():
-            if wc_class in class_mapping:
-                vegetation_found = True
-                if cnt > best_count:
-                    best_count = cnt
-                    best_class = wc_class
-                
-        if vegetation_found and best_class is not None:
-            dominant_type = class_mapping[best_class]
-            percentage = (best_count / cluster_pixels) * 100
-        else:
-            max_cnt = max(overlap_dict.values())
-            top_cls = [k for k, v in overlap_dict.items() if v == max_cnt][0]
-            if top_cls == 40: dominant_type = "Cropland"
-            elif top_cls == 50: dominant_type = "Built-up"
-            elif top_cls == 60: dominant_type = "Bare / sparse vegetation"
-            elif top_cls == 70: dominant_type = "Snow and ice"
-            elif top_cls == 80: dominant_type = "Permanent water bodies"
-            elif top_cls == 90: dominant_type = "Herbaceous wetland"
-            elif top_cls == 95: dominant_type = "Mangroves"
-            elif top_cls == 100: dominant_type = "Moss and lichen"
-            else: dominant_type = "Other"
-            
-            percentage = (max_cnt / cluster_pixels) * 100
-            
-        stats.append({
-            "Cluster": c_id,
-            "Dominant Land Cover": dominant_type,
-            "Overlap %": f"{percentage:.0f}%"
-        })
-        
-    df = pd.DataFrame(stats)
-    return df
-
 def generate_cluster_map_data(cluster_image, cluster_labels, profile):
+    print("Generating cluster map base64 encoded data...", flush=True)
     h, w = cluster_image.shape
     
     label_colors = {
@@ -460,37 +341,6 @@ def generate_cluster_map_data(cluster_image, cluster_labels, profile):
         "legend": legend
     }
 
-def generate_worldcover_map_data(worldcover_image, profile):
-    h, w = worldcover_image.shape
-    worldcover_colors = {
-        10: [0, 100, 0, 255],     # Tree cover
-        20: [255, 187, 34, 255],  # Shrubland
-        30: [255, 255, 76, 255]   # Grassland
-    }
-    rgba_worldcover = np.zeros((h, w, 4), dtype=np.uint8)
-    for val, col in worldcover_colors.items():
-        mask = worldcover_image == val
-        rgba_worldcover[mask, :] = col
-        
-    bounds = rasterio.transform.array_bounds(profile['height'], profile['width'], profile['transform'])
-    lat_min, lat_max = bounds[1], bounds[3]
-    lon_min, lon_max = bounds[0], bounds[2]
-    
-    b64_img = array_to_base64_png(rgba_worldcover)
-    
-    legend = [
-        { "color": "rgb(0,100,0)", "label": "Tree Cover" },
-        { "color": "rgb(255,187,34)", "label": "Shrubland" },
-        { "color": "rgb(255,255,76)", "label": "Grassland" }
-    ]
-    
-    return {
-        "image_data": b64_img,
-        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
-        "opacity": 0.8,
-        "legend": legend
-    }
-
 @app.route('/api/vegetation', methods=['GET'])
 def get_vegetation_clustering():
     district = request.args.get('district')
@@ -500,11 +350,13 @@ def get_vegetation_clustering():
         return jsonify({"error": "Missing district or country parameters"}), 400
         
     cache_key = f"{district}_{country}".lower().strip()
+    
     if cache_key in response_cache:
-        print(f"Returning in-memory cached response for {district}, {country}")
+        print(f"Returning in-memory cached response for {district}, {country}", flush=True)
         return jsonify(response_cache[cache_key])
         
     try:
+        print(f"--- Processing started for {district}, {country} ---", flush=True)
         # 1. Fetch boundary
         geom, gdf = get_boundary(district, country)
         
@@ -541,26 +393,17 @@ def get_vegetation_clustering():
         cluster_statistics = calculate_cluster_statistics(cluster_image, ndvi, red_edge)
         cluster_labels, cluster_stats_df = assign_cluster_labels(cluster_statistics)
         
-        # --- ESA WORLDCOVER VALIDATION PIPELINE ---
-        ee_project = "forest-monitoring-hackathon"
-        worldcover_path = download_esa_worldcover(geom, district, country, ee_project)
-        worldcover_image = process_worldcover_raster(worldcover_path, profile)
-        
-        # Calculate Overlap
-        stats_df = calculate_cluster_overlap(cluster_image, worldcover_image)
-        
         # Generate Map Data Dictionaries
         cluster_map_data = generate_cluster_map_data(cluster_image, cluster_labels, profile)
-        worldcover_map_data = generate_worldcover_map_data(worldcover_image, profile)
+        print(f"--- Processing complete for {district}, {country} ---", flush=True)
         
         response_data = {
             "maps": {
-                "cluster_map": cluster_map_data,
-                "worldcover_map": worldcover_map_data
+                "cluster_map": cluster_map_data
             },
             "district_boundary": district_boundary,
             "center": center,
-            "stats": stats_df.to_dict(orient='records')
+            "stats": cluster_stats_df.to_dict(orient='records')
         }
         
         response_cache[cache_key] = response_data
@@ -573,6 +416,6 @@ def get_vegetation_clustering():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    print("Starting Flask web server on port 5002...")
-    print("Test it via: http://127.0.0.1:5002/api/vegetation?district=Dang&country=India")
+    print("Starting Flask web server on port 5002...", flush=True)
+    print("Test it via: http://127.0.0.1:5002/api/vegetation?district=Dang&country=India", flush=True)
     app.run(host='0.0.0.0', port=5002, debug=True)
