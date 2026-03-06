@@ -40,7 +40,7 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
     Download a median composite of Sentinel-2 surface reflectance
     for the given boundary using SentinelHub.
     """
-    output_filename = "sentinel_median.tif"
+    output_filename = "sentinel_median_8bands.tif"
     if os.path.exists(output_filename):
         print(f"Found existing {output_filename}, skipping download.")
         return output_filename
@@ -65,14 +65,14 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
     time_interval = (start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
     
     # Find the single least cloudy scene
-    # We want B2, B3, B4, B8, B11. 
+    # We want B2, B3, B4, B5, B6, B7, B8, B11. 
     evalscript = """
     //VERSION=3
     function setup() {
         return {
-            input: ["B02", "B03", "B04", "B08", "B11", "dataMask"],
+            input: ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B11", "dataMask"],
             output: {
-                bands: 5,
+                bands: 8,
                 sampleType: "FLOAT32"
             }
         };
@@ -80,9 +80,9 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
     
     function evaluatePixel(sample) {
         if (sample.dataMask === 0) {
-            return [0, 0, 0, 0, 0];
+            return [0, 0, 0, 0, 0, 0, 0, 0];
         }
-        return [sample.B02, sample.B03, sample.B04, sample.B08, sample.B11];
+        return [sample.B02, sample.B03, sample.B04, sample.B05, sample.B06, sample.B07, sample.B08, sample.B11];
     }
     """
     
@@ -150,26 +150,37 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
             
     return output_filename
 
-def compute_indices(image_path):
-    print("Computing vegetation indices (NDVI, NDWI)...")
+def read_bands(image_path):
+    print(f"Reading spectral bands from {image_path}...")
     with rasterio.open(image_path) as src:
         bands = src.read()
-        transform = src.transform
-        crs = src.crs
         profile = src.profile
-
+    
     b2 = bands[0].astype('float32')
     b3 = bands[1].astype('float32')
     b4 = bands[2].astype('float32')
-    b8 = bands[3].astype('float32')
-    b11 = bands[4].astype('float32')
+    b5 = bands[3].astype('float32')
+    b6 = bands[4].astype('float32')
+    b7 = bands[5].astype('float32')
+    b8 = bands[6].astype('float32')
+    b11 = bands[7].astype('float32')
     
+    return b2, b3, b4, b5, b6, b7, b8, b11, profile
+
+def compute_ndvi(b4, b8):
+    print("Computing NDVI...")
     np.seterr(divide='ignore', invalid='ignore')
-    
     ndvi = np.where((b8 + b4) == 0., 0, (b8 - b4) / (b8 + b4))
+    return ndvi
+
+def compute_ndwi(b3, b8):
+    np.seterr(divide='ignore', invalid='ignore')
     ndwi = np.where((b3 + b8) == 0., 0, (b3 - b8) / (b3 + b8))
-    
-    return b2, b3, b4, b8, b11, ndvi, ndwi, profile
+    return ndwi
+
+def compute_red_edge_index(b5, b6, b7):
+    print("Computing Red-Edge Vegetation Index...")
+    return (b5 + b6 + b7) / 3.0
 
 def prepare_features(b2, b3, b4, b8, b11, ndvi, ndwi):
     print("Preparing feature stack for clustering...")
@@ -201,6 +212,75 @@ def run_clustering(valid_features, valid_mask, shape):
     
     cluster_image = full_clusters_flat.reshape(shape)
     return cluster_image
+
+def calculate_cluster_statistics(cluster_image, ndvi, red_edge):
+    print("Calculating cluster statistics...")
+    stats = []
+    # Pixel area = 10m * 10m = 100 m^2 = 0.0001 km^2
+    pixel_area_km2 = 0.0001
+    
+    for c_id in range(5):
+        mask = cluster_image == c_id
+        pixel_count = np.sum(mask)
+        
+        if pixel_count == 0:
+            stats.append({
+                "Cluster": c_id,
+                "Mean NDVI": 0,
+                "Mean RedEdge": 0,
+                "Pixel Count": 0,
+                "Area_km2": 0
+            })
+            continue
+            
+        mean_ndvi = np.nanmean(ndvi[mask])
+        mean_red_edge = np.nanmean(red_edge[mask])
+        area_km2 = pixel_count * pixel_area_km2
+        
+        stats.append({
+            "Cluster": c_id,
+            "Mean NDVI": float(mean_ndvi),
+            "Mean RedEdge": float(mean_red_edge),
+            "Pixel Count": int(pixel_count),
+            "Area_km2": float(area_km2)
+        })
+        
+    df = pd.DataFrame(stats)
+    return df
+
+def assign_cluster_labels(cluster_stats):
+    print("Assigning cluster labels based on spectral evidence...")
+    cluster_labels = {}
+    assigned_types = []
+    
+    for _, row in cluster_stats.iterrows():
+        c_id = int(row["Cluster"])
+        ndvi_val = row["Mean NDVI"]
+        
+        if ndvi_val >= 0.65:
+            label = "Dense Deciduous Forest (likely teak dominated)"
+        elif ndvi_val >= 0.55:
+            label = "Mixed Deciduous Forest"
+        elif ndvi_val >= 0.40:
+            label = "Bamboo / Shrub Vegetation"
+        elif ndvi_val >= 0.30:
+            label = "Grassland"
+        elif ndvi_val >= 0:
+            label = "Sparse / Degraded Grassland"
+        else:
+            label = "Water / Non-vegetation"
+            
+        cluster_labels[c_id] = label
+        assigned_types.append(label)
+        
+    # Add to dataframe for final output
+    cluster_stats["Assigned Vegetation Type"] = assigned_types
+    
+    print("\n--- Spectral Clustering Results ---")
+    print(cluster_stats[["Cluster", "Mean NDVI", "Mean RedEdge", "Assigned Vegetation Type"]].to_string(index=False))
+    print("-----------------------------------\n")
+    
+    return cluster_labels, cluster_stats
 
 def download_esa_worldcover(boundary_geom, ee_project=None):
     print("Initializing Earth Engine...")
@@ -334,32 +414,32 @@ def calculate_cluster_overlap(cluster_image, worldcover_image):
     print("")
     return df
 
-def generate_validation_maps_ee(cluster_image, worldcover_image, profile, boundary_gdf):
-    print("Generating validation maps with folium...")
+def generate_named_cluster_map(cluster_image, cluster_labels, profile, boundary_gdf):
+    print("Generating named cluster map with folium...")
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
     
     h, w = cluster_image.shape
     
-    # 1. Colors for clusters
-    colors = ['#fde725', '#5dc863', '#21908c', '#3b528b', '#440154']
+    # 1. Dynamic colors for classes
+    label_colors = {
+        "Grassland": "#e5f5f9", # Very Light Mint "Sparse / Degraded Grassland": "#ffd700", # Gold
+        "Water / Non-vegetation": "#1e90ff", # Dodger Blue
+        "Sparse/Degraded Grassland": "#00441b", # Dark Green
+        "Mixed Deciduous Forest": "#2ca25f", # Medium Green
+        "Bamboo / Shrub Vegetation": "#99d8c9", # Light Teal Green
+    }
+    
     rgba_clusters = np.zeros((h, w, 4), dtype=np.uint8)
+    cluster_hex_colors = {}
     for i in range(5):
         mask = cluster_image == i
-        hex_color = colors[i]
+        label = cluster_labels.get(i, "Unknown")
+        hex_color = label_colors.get(label, "#808080")
+        cluster_hex_colors[i] = hex_color
+        
         r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
         rgba_clusters[mask, :] = [r, g, b, 255]
-        
-    # 2. Colors for WorldCover
-    worldcover_colors = {
-        10: [0, 100, 0, 255],     # Tree cover
-        20: [255, 187, 34, 255],  # Shrubland
-        30: [255, 255, 76, 255]   # Grassland
-    }
-    rgba_worldcover = np.zeros((h, w, 4), dtype=np.uint8)
-    for val, col in worldcover_colors.items():
-        mask = worldcover_image == val
-        rgba_worldcover[mask, :] = col
         
     bounds = rasterio.transform.array_bounds(profile['height'], profile['width'], profile['transform'])
     lat_min, lat_max = bounds[1], bounds[3]
@@ -388,27 +468,45 @@ def generate_validation_maps_ee(cluster_image, worldcover_image, profile, bounda
         style_function=lambda x: {'fillColor': 'transparent', 'color': 'red', 'weight': 2}
     ).add_to(m_cluster)
     
-    legend_html_cluster = '''
+    legend_html_cluster = f'''
      <div style="position: fixed; 
-     bottom: 50px; left: 50px; width: 150px; height: 160px; 
+     bottom: 50px; left: 50px; width: 380px; height: 160px; 
      border:2px solid grey; z-index:9999; font-size:14px;
      background-color:white;
      padding: 10px;
      ">
-         <b>Clusters</b><br>
-         <i style="background:#fde725;width:15px;height:15px;float:left;margin-right:5px;"></i> C0<br>
-         <i style="background:#5dc863;width:15px;height:15px;float:left;margin-right:5px;"></i> C1<br>
-         <i style="background:#21908c;width:15px;height:15px;float:left;margin-right:5px;"></i> C2<br>
-         <i style="background:#3b528b;width:15px;height:15px;float:left;margin-right:5px;"></i> C3<br>
-         <i style="background:#440154;width:15px;height:15px;float:left;margin-right:5px;"></i> C4<br>
+         <b>Vegetation Classes (Based on Spectral Indices)</b><br>
+         <i style="background:{cluster_hex_colors.get(0, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 0 — {cluster_labels.get(0, "C0")}<br>
+         <i style="background:{cluster_hex_colors.get(1, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 1 — {cluster_labels.get(1, "C1")}<br>
+         <i style="background:{cluster_hex_colors.get(2, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 2 — {cluster_labels.get(2, "C2")}<br>
+         <i style="background:{cluster_hex_colors.get(3, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 3 — {cluster_labels.get(3, "C3")}<br>
+         <i style="background:{cluster_hex_colors.get(4, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 4 — {cluster_labels.get(4, "C4")}<br>
      </div>
      '''
     m_cluster.get_root().html.add_child(folium.Element(legend_html_cluster))
     folium.LayerControl().add_to(m_cluster)
     
-    # --- Map 2: WorldCover Map ---
+    return m_cluster
+
+def generate_worldcover_map(worldcover_image, profile, boundary_gdf):
+    h, w = worldcover_image.shape
+    worldcover_colors = {
+        10: [0, 100, 0, 255],     # Tree cover
+        20: [255, 187, 34, 255],  # Shrubland
+        30: [255, 255, 76, 255]   # Grassland
+    }
+    rgba_worldcover = np.zeros((h, w, 4), dtype=np.uint8)
+    for val, col in worldcover_colors.items():
+        mask = worldcover_image == val
+        rgba_worldcover[mask, :] = col
+        
+    bounds = rasterio.transform.array_bounds(profile['height'], profile['width'], profile['transform'])
+    lat_min, lat_max = bounds[1], bounds[3]
+    lon_min, lon_max = bounds[0], bounds[2]
+    image_bounds = [[lat_min, lon_min], [lat_max, lon_max]]
+    center_lat, center_lon = (lat_min + lat_max) / 2, (lon_min + lon_max) / 2
+
     m_wc = folium.Map(location=[center_lat, center_lon], zoom_start=10)
-    
     fg_wc = folium.FeatureGroup(name='ESA WorldCover (Vegetation classes)', show=True)
     folium.raster_layers.ImageOverlay(
         image=rgba_worldcover,
@@ -442,16 +540,19 @@ def generate_validation_maps_ee(cluster_image, worldcover_image, profile, bounda
     m_wc.get_root().html.add_child(folium.Element(legend_html_wc))
     folium.LayerControl().add_to(m_wc)
     
-    return m_cluster, m_wc
+    return m_wc
 
-def export_results(stats_df, map_cluster, map_wc):
+def export_results(stats_df, map_cluster, map_wc, cluster_stats):
     print("Exporting validation results...")
     if stats_df is not None:
         stats_df.to_csv("cluster_validation_stats.csv", index=False)
         print("Saved cluster_validation_stats.csv")
+    if cluster_stats is not None:
+        cluster_stats.to_csv("cluster_spectral_stats.csv", index=False)
+        print("Saved cluster_spectral_stats.csv")
     if map_cluster is not None:
-        map_cluster.save("cluster_map.html")
-        print("Saved cluster_map.html")
+        map_cluster.save("cluster_named_map.html")
+        print("Saved cluster_named_map.html")
     if map_wc is not None:
         map_wc.save("worldcover_map.html")
         print("Saved worldcover_map.html")
@@ -471,7 +572,11 @@ def main():
     image_path = download_sentinel(geom, client_id=sh_client_id, client_secret=sh_client_secret)
     
     # 3 & 4. Load bounds & compute indices
-    b2, b3, b4, b8, b11, ndvi, ndwi, profile = compute_indices(image_path)
+    b2, b3, b4, b5, b6, b7, b8, b11, profile = read_bands(image_path)
+    
+    ndvi = compute_ndvi(b4, b8)
+    ndwi = compute_ndwi(b3, b8)
+    red_edge = compute_red_edge_index(b5, b6, b7)
     
     # 5. Prepare Features
     valid_features, valid_mask, shape = prepare_features(b2, b3, b4, b8, b11, ndvi, ndwi)
@@ -479,15 +584,21 @@ def main():
     # 6. Clustering
     cluster_image = run_clustering(valid_features, valid_mask, shape)
     
+    # 7. Compute spectral stats & assign labels
+    cluster_statistics = calculate_cluster_statistics(cluster_image, ndvi, red_edge)
+    cluster_labels, cluster_stats_df = assign_cluster_labels(cluster_statistics)
+    
     # --- ESA WORLDCOVER VALIDATION PIPELINE ---
     ee_project = "forest-monitoring-hackathon" # <-- UPDATE THIS IF INITIALIZE FAILS
     worldcover_path = download_esa_worldcover(geom, ee_project)
     worldcover_image = process_worldcover_raster(worldcover_path, profile)
     
     stats_df = calculate_cluster_overlap(cluster_image, worldcover_image)
-    map_cluster, map_wc = generate_validation_maps_ee(cluster_image, worldcover_image, profile, gdf)
     
-    export_results(stats_df, map_cluster, map_wc)
+    map_cluster = generate_named_cluster_map(cluster_image, cluster_labels, profile, gdf)
+    map_wc = generate_worldcover_map(worldcover_image, profile, gdf)
+    
+    export_results(stats_df, map_cluster, map_wc, cluster_stats_df)
 
 if __name__ == "__main__":
     main()
