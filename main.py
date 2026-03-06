@@ -1,5 +1,7 @@
 import os
 import io
+import json
+import base64
 import datetime
 import numpy as np
 import pandas as pd
@@ -9,7 +11,6 @@ from rasterio import features
 from rasterio.warp import reproject, Resampling
 from rasterio.mask import mask
 from sklearn.cluster import KMeans
-import folium
 from shapely.geometry import mapping, box
 import geopandas as gpd
 
@@ -19,15 +20,32 @@ import zipfile
 
 from sentinelhub import SHConfig, SentinelHubRequest, SentinelHubDownloadClient, BBox, CRS, DataCollection, MimeType, bbox_to_dimensions
 
+from flask import Flask, request, jsonify
+from PIL import Image
+
+app = Flask(__name__)
+
+# Simple in-memory cache for API responses
+response_cache = {}
+
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+def array_to_base64_png(rgba_array):
+    img = Image.fromarray(rgba_array, 'RGBA')
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    return "data:image/png;base64," + b64
+
 def get_boundary(district, country):
-    """
-    Use osmnx to fetch the boundary of the given district and country.
-    Returns a GeoJSON-like dictionary and a shapely polygon.
-    """
     place_query = f"{district}, {country}"
     print(f"Fetching boundary for {place_query}...")
     try:
-        # Fetch the geometry
         gdf = ox.geocode_to_gdf(place_query)
         geom = gdf.iloc[0].geometry
         return geom, gdf
@@ -35,12 +53,9 @@ def get_boundary(district, country):
         print(f"Error fetching boundary: {e}")
         raise
 
-def download_sentinel(boundary_geom, client_id=None, client_secret=None):
-    """
-    Download a median composite of Sentinel-2 surface reflectance
-    for the given boundary using SentinelHub.
-    """
-    output_filename = "sentinel_median_8bands.tif"
+def download_sentinel(boundary_geom, district, country, client_id=None, client_secret=None):
+    safe_name = f"{district.replace(' ', '_')}_{country.replace(' ', '_')}".lower()
+    output_filename = f"sentinel_median_{safe_name}.tif"
     if os.path.exists(output_filename):
         print(f"Found existing {output_filename}, skipping download.")
         return output_filename
@@ -54,18 +69,13 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
     
     print("Fetching Sentinel-2 median composite from SentinelHub...")
     
-    # Get bounding box of the geometry
     minx, miny, maxx, maxy = boundary_geom.bounds
     bbox = BBox(bbox=[minx, miny, maxx, maxy], crs=CRS.WGS84)
     
     end_date = datetime.datetime.now()
-    # SentinelHub Free Tier struggles with massive temporal medians. 
-    # Use 30 days composite instead of 365 days.
     start_date = end_date - datetime.timedelta(days=30)
     time_interval = (start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
     
-    # Find the single least cloudy scene
-    # We want B2, B3, B4, B5, B6, B7, B8, B11. 
     evalscript = """
     //VERSION=3
     function setup() {
@@ -86,7 +96,6 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
     }
     """
     
-    # Let's cap at 1000x1000 pixels to be safe for free tier processing units (PU limits)
     size_x, size_y = bbox_to_dimensions(bbox, resolution=10)
     
     if size_x > 1000:
@@ -98,13 +107,13 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
         size_y = 1000
         size_x = int(size_x * ratio)
 
-    request = SentinelHubRequest(
+    request_sh = SentinelHubRequest(
         evalscript=evalscript,
         input_data=[
             SentinelHubRequest.input_data(
                 data_collection=DataCollection.SENTINEL2_L2A,
                 time_interval=time_interval,
-                maxcc=0.2, # Extremely strict cloud cover filter to pick a single clean image
+                maxcc=0.2,
                 mosaicking_order="leastCC"
             )
         ],
@@ -116,12 +125,12 @@ def download_sentinel(boundary_geom, client_id=None, client_secret=None):
         config=config
     )
     
-    data = request.get_data()
+    data = request_sh.get_data()
     
     if len(data) == 0:
         raise ValueError("No data returned from SentinelHub.")
         
-    image_array = data[0] # The median composite
+    image_array = data[0]
     
     print(f"Saving downloaded image to {output_filename}... dimensions: {image_array.shape}")
     
@@ -273,16 +282,11 @@ def assign_cluster_labels(cluster_stats):
         cluster_labels[c_id] = label
         assigned_types.append(label)
         
-    # Add to dataframe for final output
     cluster_stats["Assigned Vegetation Type"] = assigned_types
-    
-    print("\n--- Spectral Clustering Results ---")
-    print(cluster_stats[["Cluster", "Mean NDVI", "Mean RedEdge", "Assigned Vegetation Type"]].to_string(index=False))
-    print("-----------------------------------\n")
     
     return cluster_labels, cluster_stats
 
-def download_esa_worldcover(boundary_geom, ee_project=None):
+def download_esa_worldcover(boundary_geom, district, country, ee_project=None):
     print("Initializing Earth Engine...")
     try:
         if ee_project:
@@ -291,11 +295,11 @@ def download_esa_worldcover(boundary_geom, ee_project=None):
             ee.Initialize()
     except Exception as e:
         print(f"Earth Engine not initialized: {e}")
-        print("Please update 'ee_project' in main.py with your Google Cloud Project ID.")
         raise
 
 
-    output_filename = "worldcover_reference.tif"
+    safe_name = f"{district.replace(' ', '_')}_{country.replace(' ', '_')}".lower()
+    output_filename = f"worldcover_reference_{safe_name}.tif"
     if os.path.exists(output_filename):
         print(f"Found existing {output_filename}, skipping download.")
         return output_filename
@@ -385,7 +389,6 @@ def calculate_cluster_overlap(cluster_image, worldcover_image):
             dominant_type = class_mapping[best_class]
             percentage = (best_count / cluster_pixels) * 100
         else:
-            # Not primarily vegetation. Find the actual dominant type.
             max_cnt = max(overlap_dict.values())
             top_cls = [k for k, v in overlap_dict.items() if v == max_cnt][0]
             if top_cls == 40: dominant_type = "Cropland"
@@ -407,88 +410,57 @@ def calculate_cluster_overlap(cluster_image, worldcover_image):
         })
         
     df = pd.DataFrame(stats)
-    print("")
-    print("--- Validation Statistics ---")
-    print(df.to_string(index=False))
-    print("-----------------------------")
-    print("")
     return df
 
-def generate_named_cluster_map(cluster_image, cluster_labels, profile, boundary_gdf):
-    print("Generating named cluster map with folium...")
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
-    
+def generate_cluster_map_data(cluster_image, cluster_labels, profile):
     h, w = cluster_image.shape
     
-    # 1. Dynamic colors for classes
     label_colors = {
-        "Grassland": "#e5f5f9", # Very Light Mint "Sparse / Degraded Grassland": "#ffd700", # Gold
-        "Water / Non-vegetation": "#1e90ff", # Dodger Blue
-        "Sparse/Degraded Grassland": "#00441b", # Dark Green
-        "Mixed Deciduous Forest": "#2ca25f", # Medium Green
-        "Bamboo / Shrub Vegetation": "#99d8c9", # Light Teal Green
+        "Grassland": "#e5f5f9", 
+        "Water / Non-vegetation": "#1e90ff", 
+        "Sparse / Degraded Grassland": "#ffd700", 
+        "Sparse/Degraded Grassland": "#00441b", 
+        "Mixed Deciduous Forest": "#2ca25f", 
+        "Bamboo / Shrub Vegetation": "#99d8c9", 
+        "Dense Deciduous Forest (likely teak dominated)": "#006d2c"
     }
     
     rgba_clusters = np.zeros((h, w, 4), dtype=np.uint8)
     cluster_hex_colors = {}
+    
     for i in range(5):
         mask = cluster_image == i
         label = cluster_labels.get(i, "Unknown")
         hex_color = label_colors.get(label, "#808080")
         cluster_hex_colors[i] = hex_color
         
-        r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+        if len(hex_color) == 7:
+            r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+        else:
+            r, g, b = 128, 128, 128
         rgba_clusters[mask, :] = [r, g, b, 255]
         
     bounds = rasterio.transform.array_bounds(profile['height'], profile['width'], profile['transform'])
     lat_min, lat_max = bounds[1], bounds[3]
     lon_min, lon_max = bounds[0], bounds[2]
     
-    image_bounds = [[lat_min, lon_min], [lat_max, lon_max]]
-    center_lat, center_lon = (lat_min + lat_max) / 2, (lon_min + lon_max) / 2
+    b64_img = array_to_base64_png(rgba_clusters)
     
-    # --- Map 1: Cluster Map ---
-    m_cluster = folium.Map(location=[center_lat, center_lon], zoom_start=10)
-    
-    fg_clusters = folium.FeatureGroup(name='Vegetation Clusters', show=True)
-    folium.raster_layers.ImageOverlay(
-        image=rgba_clusters,
-        bounds=image_bounds,
-        opacity=1.0,
-        name='Vegetation Clusters',
-        interactive=True,
-        cross_origin=False
-    ).add_to(fg_clusters)
-    fg_clusters.add_to(m_cluster)
-    
-    folium.GeoJson(
-        boundary_gdf,
-        name="District Boundary",
-        style_function=lambda x: {'fillColor': 'transparent', 'color': 'red', 'weight': 2}
-    ).add_to(m_cluster)
-    
-    legend_html_cluster = f'''
-     <div style="position: fixed; 
-     bottom: 50px; left: 50px; width: 380px; height: 160px; 
-     border:2px solid grey; z-index:9999; font-size:14px;
-     background-color:white;
-     padding: 10px;
-     ">
-         <b>Vegetation Classes (Based on Spectral Indices)</b><br>
-         <i style="background:{cluster_hex_colors.get(0, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 0 — {cluster_labels.get(0, "C0")}<br>
-         <i style="background:{cluster_hex_colors.get(1, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 1 — {cluster_labels.get(1, "C1")}<br>
-         <i style="background:{cluster_hex_colors.get(2, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 2 — {cluster_labels.get(2, "C2")}<br>
-         <i style="background:{cluster_hex_colors.get(3, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 3 — {cluster_labels.get(3, "C3")}<br>
-         <i style="background:{cluster_hex_colors.get(4, '#808080')};width:15px;height:15px;float:left;margin-right:5px;"></i> Cluster 4 — {cluster_labels.get(4, "C4")}<br>
-     </div>
-     '''
-    m_cluster.get_root().html.add_child(folium.Element(legend_html_cluster))
-    folium.LayerControl().add_to(m_cluster)
-    
-    return m_cluster
+    legend = []
+    for i in range(5):
+        legend.append({
+            "color": cluster_hex_colors.get(i, "#808080"),
+            "label": cluster_labels.get(i, f"C{i}")
+        })
+        
+    return {
+        "image_data": b64_img,
+        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
+        "opacity": 1.0,
+        "legend": legend
+    }
 
-def generate_worldcover_map(worldcover_image, profile, boundary_gdf):
+def generate_worldcover_map_data(worldcover_image, profile):
     h, w = worldcover_image.shape
     worldcover_colors = {
         10: [0, 100, 0, 255],     # Tree cover
@@ -503,102 +475,104 @@ def generate_worldcover_map(worldcover_image, profile, boundary_gdf):
     bounds = rasterio.transform.array_bounds(profile['height'], profile['width'], profile['transform'])
     lat_min, lat_max = bounds[1], bounds[3]
     lon_min, lon_max = bounds[0], bounds[2]
-    image_bounds = [[lat_min, lon_min], [lat_max, lon_max]]
-    center_lat, center_lon = (lat_min + lat_max) / 2, (lon_min + lon_max) / 2
+    
+    b64_img = array_to_base64_png(rgba_worldcover)
+    
+    legend = [
+        { "color": "rgb(0,100,0)", "label": "Tree Cover" },
+        { "color": "rgb(255,187,34)", "label": "Shrubland" },
+        { "color": "rgb(255,255,76)", "label": "Grassland" }
+    ]
+    
+    return {
+        "image_data": b64_img,
+        "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
+        "opacity": 0.8,
+        "legend": legend
+    }
 
-    m_wc = folium.Map(location=[center_lat, center_lon], zoom_start=10)
-    fg_wc = folium.FeatureGroup(name='ESA WorldCover (Vegetation classes)', show=True)
-    folium.raster_layers.ImageOverlay(
-        image=rgba_worldcover,
-        bounds=image_bounds,
-        opacity=1.0,
-        name='WorldCover Vegetation',
-        interactive=True,
-        cross_origin=False
-    ).add_to(fg_wc)
-    fg_wc.add_to(m_wc)
+@app.route('/api/vegetation', methods=['GET'])
+def get_vegetation_clustering():
+    district = request.args.get('district')
+    country = request.args.get('country')
     
-    folium.GeoJson(
-        boundary_gdf,
-        name="District Boundary",
-        style_function=lambda x: {'fillColor': 'transparent', 'color': 'red', 'weight': 2}
-    ).add_to(m_wc)
-    
-    legend_html_wc = '''
-     <div style="position: fixed; 
-     bottom: 50px; left: 50px; width: 150px; height: 120px; 
-     border:2px solid grey; z-index:9999; font-size:14px;
-     background-color:white;
-     padding: 10px;
-     ">
-         <b>WorldCover</b><br>
-         <i style="background:rgb(0,100,0);width:15px;height:15px;float:left;margin-right:5px;"></i> Tree Cover<br>
-         <i style="background:rgb(255,187,34);width:15px;height:15px;float:left;margin-right:5px;"></i> Shrubland<br>
-         <i style="background:rgb(255,255,76);width:15px;height:15px;float:left;margin-right:5px;"></i> Grassland<br>
-     </div>
-     '''
-    m_wc.get_root().html.add_child(folium.Element(legend_html_wc))
-    folium.LayerControl().add_to(m_wc)
-    
-    return m_wc
+    if not district or not country:
+        return jsonify({"error": "Missing district or country parameters"}), 400
+        
+    cache_key = f"{district}_{country}".lower().strip()
+    if cache_key in response_cache:
+        print(f"Returning in-memory cached response for {district}, {country}")
+        return jsonify(response_cache[cache_key])
+        
+    try:
+        # 1. Fetch boundary
+        geom, gdf = get_boundary(district, country)
+        
+        # Convert GeoDataFrame to GeoJSON Dictionary
+        district_boundary = json.loads(gdf.to_json())
+        
+        # Extract center from bbox
+        minx, miny, maxx, maxy = geom.bounds
+        center_lat = (miny + maxy) / 2
+        center_lon = (minx + maxx) / 2
+        center = [center_lat, center_lon]
+        
+        # SENTINELHUB CREDENTIALS
+        sh_client_id = "35e5cc9a-7035-4c81-bf32-6c6b3b160d57"
+        sh_client_secret = "wXOhYtIKKLuMLUUNX8wwzS5KzQur1N2r"
+        
+        # 2. Download imagery via SentinelHub
+        image_path = download_sentinel(geom, district, country, client_id=sh_client_id, client_secret=sh_client_secret)
+        
+        # 3 & 4. Load bounds & compute indices
+        b2, b3, b4, b5, b6, b7, b8, b11, profile = read_bands(image_path)
+        
+        ndvi = compute_ndvi(b4, b8)
+        ndwi = compute_ndwi(b3, b8)
+        red_edge = compute_red_edge_index(b5, b6, b7)
+        
+        # 5. Prepare Features
+        valid_features, valid_mask, shape = prepare_features(b2, b3, b4, b8, b11, ndvi, ndwi)
+        
+        # 6. Clustering
+        cluster_image = run_clustering(valid_features, valid_mask, shape)
+        
+        # 7. Compute spectral stats & assign labels
+        cluster_statistics = calculate_cluster_statistics(cluster_image, ndvi, red_edge)
+        cluster_labels, cluster_stats_df = assign_cluster_labels(cluster_statistics)
+        
+        # --- ESA WORLDCOVER VALIDATION PIPELINE ---
+        ee_project = "forest-monitoring-hackathon"
+        worldcover_path = download_esa_worldcover(geom, district, country, ee_project)
+        worldcover_image = process_worldcover_raster(worldcover_path, profile)
+        
+        # Calculate Overlap
+        stats_df = calculate_cluster_overlap(cluster_image, worldcover_image)
+        
+        # Generate Map Data Dictionaries
+        cluster_map_data = generate_cluster_map_data(cluster_image, cluster_labels, profile)
+        worldcover_map_data = generate_worldcover_map_data(worldcover_image, profile)
+        
+        response_data = {
+            "maps": {
+                "cluster_map": cluster_map_data,
+                "worldcover_map": worldcover_map_data
+            },
+            "district_boundary": district_boundary,
+            "center": center,
+            "stats": stats_df.to_dict(orient='records')
+        }
+        
+        response_cache[cache_key] = response_data
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
-def export_results(stats_df, map_cluster, map_wc, cluster_stats):
-    print("Exporting validation results...")
-    if stats_df is not None:
-        stats_df.to_csv("cluster_validation_stats.csv", index=False)
-        print("Saved cluster_validation_stats.csv")
-    if cluster_stats is not None:
-        cluster_stats.to_csv("cluster_spectral_stats.csv", index=False)
-        print("Saved cluster_spectral_stats.csv")
-    if map_cluster is not None:
-        map_cluster.save("cluster_named_map.html")
-        print("Saved cluster_named_map.html")
-    if map_wc is not None:
-        map_wc.save("worldcover_map.html")
-        print("Saved worldcover_map.html")
-
-def main():
-    district = "Dang"
-    country = "India"
-    
-    # 1. Fetch boundary
-    geom, gdf = get_boundary(district, country)
-    
-    # SENTINELHUB CREDENTIALS
-    sh_client_id = "35e5cc9a-7035-4c81-bf32-6c6b3b160d57"
-    sh_client_secret = "wXOhYtIKKLuMLUUNX8wwzS5KzQur1N2r"
-    
-    # 2. Download imagery via SentinelHub
-    image_path = download_sentinel(geom, client_id=sh_client_id, client_secret=sh_client_secret)
-    
-    # 3 & 4. Load bounds & compute indices
-    b2, b3, b4, b5, b6, b7, b8, b11, profile = read_bands(image_path)
-    
-    ndvi = compute_ndvi(b4, b8)
-    ndwi = compute_ndwi(b3, b8)
-    red_edge = compute_red_edge_index(b5, b6, b7)
-    
-    # 5. Prepare Features
-    valid_features, valid_mask, shape = prepare_features(b2, b3, b4, b8, b11, ndvi, ndwi)
-    
-    # 6. Clustering
-    cluster_image = run_clustering(valid_features, valid_mask, shape)
-    
-    # 7. Compute spectral stats & assign labels
-    cluster_statistics = calculate_cluster_statistics(cluster_image, ndvi, red_edge)
-    cluster_labels, cluster_stats_df = assign_cluster_labels(cluster_statistics)
-    
-    # --- ESA WORLDCOVER VALIDATION PIPELINE ---
-    ee_project = "forest-monitoring-hackathon" # <-- UPDATE THIS IF INITIALIZE FAILS
-    worldcover_path = download_esa_worldcover(geom, ee_project)
-    worldcover_image = process_worldcover_raster(worldcover_path, profile)
-    
-    stats_df = calculate_cluster_overlap(cluster_image, worldcover_image)
-    
-    map_cluster = generate_named_cluster_map(cluster_image, cluster_labels, profile, gdf)
-    map_wc = generate_worldcover_map(worldcover_image, profile, gdf)
-    
-    export_results(stats_df, map_cluster, map_wc, cluster_stats_df)
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    print("Starting Flask web server on port 5002...")
+    print("Test it via: http://127.0.0.1:5002/api/vegetation?district=Dang&country=India")
+    app.run(host='0.0.0.0', port=5002, debug=True)
