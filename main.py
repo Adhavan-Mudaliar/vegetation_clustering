@@ -300,10 +300,8 @@ def generate_cluster_map_data(cluster_image, cluster_labels, profile):
         "Grassland": "#e5f5f9", 
         "Water / Non-vegetation": "#1e90ff", 
         "Sparse / Degraded Grassland": "#ffd700", 
-        "Sparse/Degraded Grassland": "#00441b", 
         "Mixed Deciduous Forest": "#2ca25f", 
         "Bamboo / Shrub Vegetation": "#99d8c9", 
-        "Dense Deciduous Forest (likely teak dominated)": "#006d2c"
     }
     
     rgba_clusters = np.zeros((h, w, 4), dtype=np.uint8)
@@ -328,10 +326,10 @@ def generate_cluster_map_data(cluster_image, cluster_labels, profile):
     b64_img = array_to_base64_png(rgba_clusters)
     
     legend = []
-    for i in range(5):
+    for label, color in label_colors.items():
         legend.append({
-            "color": cluster_hex_colors.get(i, "#808080"),
-            "label": cluster_labels.get(i, f"C{i}")
+            "color": color,
+            "label": label
         })
         
     return {

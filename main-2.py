@@ -37,6 +37,10 @@ class VegetationMapRequest(BaseModel):
     district: str
     state: str
 
+class TreeCountRequest(BaseModel):
+    district: str
+    state: str
+
 
 @app.post("/api/fire-risk")
 async def get_fire_risk(request: FireRiskRequest):
@@ -153,10 +157,45 @@ async def get_fire_risk(request: FireRiskRequest):
                     "risk": round(props.get('FireRisk', 0), 4)
                 })
                 
+        # 7. Compute Monthly NDVI History (Past 6 Months)
+        monthly_ndvi_history = {}
+        for i in range(6):
+            # Calculate 30-day window for each month
+            m_end = end_date - datetime.timedelta(days=i*30)
+            m_start = m_end - datetime.timedelta(days=30)
+            
+            s2_month = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+                .filterBounds(geom) \
+                .filterDate(m_start.strftime('%Y-%m-%d'), m_end.strftime('%Y-%m-%d')) \
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+                
+            def calculate_ndvi(img):
+                return img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+                
+            # Compute mean NDVI for this specific month
+            month_ndvi_img = s2_month.map(calculate_ndvi).mean()
+            
+            # Reduce to scalar for the district
+            m_ndvi_val = month_ndvi_img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geom,
+                scale=1000,
+                maxPixels=1e9
+            ).getInfo().get('NDVI', 0)
+            
+            # Map labels: month_1 (most recent) to month_6
+            monthly_ndvi_history[f"month_{i+1}"] = round(m_ndvi_val, 4) if m_ndvi_val is not None else 0
+
+        # Calculate the overall 6-month average from the monthly values
+        valid_vals = [v for v in monthly_ndvi_history.values() if v is not None and v != 0]
+        avg_ndvi_6_months = sum(valid_vals) / len(valid_vals) if valid_vals else 0
+
         return {
             "district": request.district,
             "state": request.state,
-            "high_risk_zones": results
+            "high_risk_zones": results,
+            "avg_ndvi_6_months": round(avg_ndvi_6_months, 4),
+            "monthly_ndvi_history": monthly_ndvi_history
         }
         
     except Exception as e:
@@ -183,10 +222,11 @@ async def get_vegetation_map(request: VegetationMapRequest):
         geom = region.geometry()
         
         # 1. District boundary feature
+        boundary_info = region.getInfo()
         boundary_feature = {
             "type": "Feature",
             "properties": {"name": f"{request.district}, {request.state}"},
-            "geometry": geom.getInfo()
+            "geometry": boundary_info['geometry']
         }
         
         # 2. Bounding Box and Center
@@ -198,45 +238,39 @@ async def get_vegetation_map(request: VegetationMapRequest):
         
         center_coords = geom.centroid().getInfo()['coordinates'] # [lon, lat]
         
-        # 3. Sentinel-2 Clustering (Age/Health Proxy)
-        # Pinning to 2023 to ensure sufficient cloud-free data for training
-        s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+        # 3. Sentinel-2 NDVI Clustering (Health Focus - Full District)
+        s2_col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
             .filterBounds(geom) \
             .filterDate('2023-01-01', '2023-12-31') \
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50)) \
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) \
             .median() \
             .clip(geom)
             
-        training = s2.sample(
+        # Calculate NDVI: (B8 - B4) / (B8 + B4)
+        ndvi = s2_col.normalizedDifference(['B8', 'B4']).rename('NDVI')
+            
+        training = ndvi.sample(
             region=geom,
-            scale=500,
-            numPixels=1000
+            scale=500, # Back to district scale
+            numPixels=2000
         )
+        
+        # Use 5 clusters for health levels
         clusterer = ee.Clusterer.wekaKMeans(5).train(training)
-        cluster_image = s2.cluster(clusterer)
+        cluster_image = ndvi.cluster(clusterer)
+        
+        # Palette: Red (Poor) to Green (Excellent)
+        health_palette = ['#e74c3c', '#e67e22', '#f1c40f', '#2ecc71', '#27ae60'] # Red to Dark Green
         
         cluster_thumb_url = cluster_image.getThumbURL({
             'min': 0, 'max': 4,
-            'palette': ['fde725', '5dc863', '21908c', '3b528b', '440154'],
+            'palette': health_palette,
             'region': geom,
-            'dimensions': 512,
+            'dimensions': 500, # Fixed 500x500
             'format': 'png'
         })
         
-        # 4. ESA WorldCover (Vegetation)
-        worldcover = ee.ImageCollection("ESA/WorldCover/v200").first().clip(geom)
-        veg_mask = worldcover.eq(10).Or(worldcover.eq(20)).Or(worldcover.eq(30))
-        veg_layer = worldcover.updateMask(veg_mask)
-        
-        wc_thumb_url = veg_layer.getThumbURL({
-            'min': 10, 'max': 30,
-            'palette': ['006400', 'FFBB22', 'FFFF4C'], 
-            'region': geom,
-            'dimensions': 512,
-            'format': 'png'
-        })
-        
-        # 5. Fetch and encode images
+        # 4. Fetch and encode image
         def fetch_b64(url):
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
@@ -246,31 +280,52 @@ async def get_vegetation_map(request: VegetationMapRequest):
                 return "data:image/png;base64," + base64.b64encode(response.read()).decode('utf-8')
                 
         cluster_b64 = fetch_b64(cluster_thumb_url)
-        wc_b64 = fetch_b64(wc_thumb_url)
         
-        # 6. Construct Response
+        # 4.5 Compute Average NDVI for the district
+        avg_ndvi_stats = ndvi.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=geom,
+            scale=500,
+            maxPixels=1e9
+        ).getInfo()
+        avg_ndvi = avg_ndvi_stats.get('NDVI', 0)
+        
+        # 4.7 Compute Monthly NDVI History (Past 6 Months) for Vegetation Map
+        monthly_ndvi_history = {}
+        # Re-use end_date if defined, or get current date
+        history_end_date = datetime.datetime.now()
+        for i in range(6):
+            m_end = history_end_date - datetime.timedelta(days=i*30)
+            m_start = m_end - datetime.timedelta(days=30)
+            s2_month = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+                .filterBounds(geom) \
+                .filterDate(m_start.strftime('%Y-%m-%d'), m_end.strftime('%Y-%m-%d')) \
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+            
+            month_ndvi_img = s2_month.map(lambda img: img.normalizedDifference(['B8', 'B4']).rename('NDVI')).mean()
+            m_ndvi_val = month_ndvi_img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geom,
+                scale=1000,
+                maxPixels=1e9
+            ).getInfo().get('NDVI', 0)
+            monthly_ndvi_history[f"month_{i+1}"] = round(m_ndvi_val, 4) if m_ndvi_val is not None else 0
+        
+        # 5. Construct Response
         return {
+            "avg_ndvi": round(avg_ndvi, 4) if avg_ndvi is not None else 0,
+            "monthly_ndvi_history": monthly_ndvi_history,
             "maps": {
-                "cluster_map": {
+                "health_map": {
                     "image_data": cluster_b64,
                     "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
                     "opacity": 1.0,
                     "legend": [
-                        { "color": "#fde725", "label": "C0" },
-                        { "color": "#5dc863", "label": "C1" },
-                        { "color": "#21908c", "label": "C2" },
-                        { "color": "#3b528b", "label": "C3" },
-                        { "color": "#440154", "label": "C4" }
-                    ]
-                },
-                "worldcover_map": {
-                    "image_data": wc_b64,
-                    "bounds": [[lat_min, lon_min], [lat_max, lon_max]],
-                    "opacity": 0.8,
-                    "legend": [
-                        { "color": "rgb(0,100,0)", "label": "Tree Cover" },
-                        { "color": "rgb(255,187,34)", "label": "Shrubland" },
-                        { "color": "rgb(255,255,76)", "label": "Grassland" }
+                        { "color": "#e74c3c", "label": "Very Poor Health" },
+                        { "color": "#e67e22", "label": "Poor Health" },
+                        { "color": "#f1c40f", "label": "Average Health" },
+                        { "color": "#2ecc71", "label": "Good Health" },
+                        { "color": "#27ae60", "label": "Excellent Health" }
                     ]
                 }
             },
@@ -285,6 +340,85 @@ async def get_vegetation_map(request: VegetationMapRequest):
         traceback.print_exc()
         if hasattr(e, 'read'):
             print("HTTP Error Body:", e.read().decode('utf-8'))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/tree-count")
+async def get_tree_count(request: TreeCountRequest):
+    try:
+        try:
+            ee.Initialize()
+        except:
+             raise HTTPException(status_code=500, detail="Google Earth Engine is not authenticated. Please run `earthengine authenticate`.")
+
+        gaul = ee.FeatureCollection("FAO/GAUL/2015/level2")
+        region = gaul.filter(ee.Filter.And(
+            ee.Filter.eq('ADM2_NAME', request.district),
+            ee.Filter.eq('ADM1_NAME', request.state)
+        )).first()
+        
+        info = region.getInfo()
+        if not info:
+            raise HTTPException(status_code=404, detail=f"District '{request.district}' or State '{request.state}' not found in GAUL dataset.")
+        
+        geom = region.geometry()
+        
+        # Load ESA WorldCover v200
+        worldcover = ee.ImageCollection("ESA/WorldCover/v200").first().clip(geom)
+        
+        # Class 10 is 'Trees'
+        tree_mask = worldcover.eq(10).selfMask()
+        
+        # Calculate tree coverage area using pixelArea()
+        # pixelArea() returns the area of each pixel in square meters
+        tree_area_img = ee.Image.pixelArea().updateMask(tree_mask)
+        
+        # Sum the area (m2) and count the pixels
+        stats = tree_area_img.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=geom,
+            scale=30,
+            maxPixels=1e9
+        ).getInfo()
+        
+        # Count the pixels using sum() on the binary mask (1 for trees, 0 otherwise)
+        tree_binary = worldcover.eq(10).rename('pixels')
+        pixel_count_stats = tree_binary.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=geom,
+            scale=30,
+            maxPixels=1e9
+        ).getInfo()
+        
+        # Total area of the district
+        total_area_m2 = geom.area().getInfo()
+        
+        tree_area_m2 = stats.get('area', 0)
+        # The key for the sum will be the band name 'pixels'
+        tree_pixel_count = pixel_count_stats.get('pixels', 0)
+        
+        # Convert to sqkm
+        tree_area_sqkm = round(tree_area_m2 / 1000000, 2)
+        total_area_sqkm = round(total_area_m2 / 1000000, 2)
+        
+        # Calculate percentage
+        coverage_percentage = round((tree_area_m2 / total_area_m2) * 100, 2) if total_area_m2 > 0 else 0
+        
+        # Estimate tree population (Assuming 50,000 trees per sq km)
+        estimated_tree_population = int(tree_area_sqkm * 42500)
+        
+        return {
+            "district": request.district,
+            "state": request.state,
+            "tree_metrics": {
+                "tree_area_sqkm": tree_area_sqkm,
+                "total_district_area_sqkm": total_area_sqkm,
+                "tree_coverage_percentage": coverage_percentage,
+                "estimated_tree_population": estimated_tree_population
+            }
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":

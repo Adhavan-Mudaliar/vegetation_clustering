@@ -6,3 +6,82 @@ INFO:     127.0.0.1:51872 - "OPTIONS /api/fire-risk HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52010 - "OPTIONS /api/fire-risk HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52010 - "POST /api/fire-risk HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52012 - "POST /api/fire-risk HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56476 - "OPTIONS /api/fire-risk HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56476 - "POST /api/fire-risk HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56869 - "POST /api/fire-risk HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57484 - "OPTIONS /api/fire-risk HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57484 - "POST /api/fire-risk HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57775 - "POST /api/fire-risk HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58636 - "POST /api/fire-risk HTTP/1.1" 200 OK
+Traceback (most recent call last):
+  File "/Users/adhavan/.gemini/antigravity/scratch/vegetation_clustering/main-2.py", line 181, in get_vegetation_map
+    geometry=geom,
+fastapi.exceptions.HTTPException: 404: District 'Dang' or State 'Gujarat' not found in GAUL dataset.
+INFO:     127.0.0.1:58734 - "POST /api/vegetation-map HTTP/1.1" 500 Internal Server Error
+Traceback (most recent call last):
+  File "/Users/adhavan/.gemini/antigravity/scratch/vegetation_clustering/main-2.py", line 248, in get_vegetation_map
+  File "/Users/adhavan/.gemini/antigravity/scratch/vegetation_clustering/main-2.py", line 245, in fetch_b64
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) \
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 493, in open
+    response = meth(req, response)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 602, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 531, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 464, in _call_chain
+    result = func(*args)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 611, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 400: Bad Request
+HTTP Error Body: {
+  "error": {
+    "code": 400,
+    "message": "User memory limit exceeded.",
+    "status": "INVALID_ARGUMENT"
+  }
+}
+
+INFO:     127.0.0.1:58739 - "POST /api/vegetation-map HTTP/1.1" 500 Internal Server Error
+Traceback (most recent call last):
+  File "/Users/adhavan/.gemini/antigravity/scratch/vegetation_clustering/main-2.py", line 248, in get_vegetation_map
+  File "/Users/adhavan/.gemini/antigravity/scratch/vegetation_clustering/main-2.py", line 245, in fetch_b64
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) \
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 493, in open
+    response = meth(req, response)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 602, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 531, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 464, in _call_chain
+    result = func(*args)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 611, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 400: Bad Request
+HTTP Error Body: {
+  "error": {
+    "code": 400,
+    "message": "User memory limit exceeded.",
+    "status": "INVALID_ARGUMENT"
+  }
+}
+
+INFO:     127.0.0.1:58846 - "POST /api/vegetation-map HTTP/1.1" 500 Internal Server Error
+INFO:     127.0.0.1:58846 - "POST /api/vegetation-map HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59043 - "POST /api/tree-count HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:59117 - "POST /api/tree-count HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:59137 - "POST /api/tree-count HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:59140 - "POST /api/tree-count HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:59143 - "POST /api/tree-count HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:59212 - "POST /api/tree-count HTTP/1.1" 404 Not Found
