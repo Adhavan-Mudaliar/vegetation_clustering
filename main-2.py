@@ -484,6 +484,73 @@ async def get_tree_count(request: TreeCountRequest):
         # Estimate tree population (Assuming 50,000 trees per sq km)
         estimated_tree_population = int(tree_area_sqkm * 42500)
         
+        # -------------------------------------------------------------
+        # Compute Historic Tree Coverage (Past 5 Months + Current Month)
+        # Using S2 NDVI thresholding proxy (NDVI > 0.6) as trees
+        # -------------------------------------------------------------
+        history_end_date = datetime.datetime.now()
+        ee_months = []
+        months_keys = []
+        for i in range(6):
+            m_end = history_end_date - datetime.timedelta(days=i*30)
+            m_start = m_end - datetime.timedelta(days=30)
+            
+            s2_month = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+                .filterBounds(geom) \
+                .filterDate(m_start.strftime('%Y-%m-%d'), m_end.strftime('%Y-%m-%d')) \
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+            
+            month_ndvi_img = s2_month.map(lambda img: img.normalizedDifference(['B8', 'B4']).rename('NDVI')).mean()
+            
+            # Check if image has bands
+            has_bands = month_ndvi_img.bandNames().size().gt(0)
+            
+            # Mask pixels with NDVI >= 0.6 (proxy for dense tree cover)
+            # Only run .gte() if it has bands, otherwise return an empty image mask
+            tree_mask_proxy = ee.Image(ee.Algorithms.If(
+                has_bands,
+                month_ndvi_img.gte(0.5), # Proxy for dense tree cover
+                ee.Image(0).rename('NDVI')
+            ))
+            
+            # Use mean() on the binary mask (1 or 0) to get the fraction of unmasked 
+            # cloud-free pixels that have NDVI >= 0.5
+            m_tree_frac = tree_mask_proxy.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geom,
+                scale=1000,
+                maxPixels=1e9
+            )
+            
+            m_tree_safe = ee.Algorithms.If(m_tree_frac.contains('NDVI'), m_tree_frac.get('NDVI'), 0)
+            ee_months.append(m_tree_safe)
+            months_keys.append(f"month_{6-i}") # month_6 is current
+            
+        dict_ee = ee.Dictionary.fromLists(months_keys, ee_months).getInfo()
+        
+        historic_coverage = {}
+        fallback_val = coverage_percentage
+        
+        valid_history_vals = []
+        for k in months_keys:
+            m_frac = dict_ee.get(k)
+            # The exact fraction is converted to percentage
+            if m_frac is not None:
+                cov_pct = round(m_frac * 100, 2)
+                if cov_pct > 0:
+                    valid_history_vals.append(cov_pct)
+        
+        if valid_history_vals:
+            fallback_val = sum(valid_history_vals) / len(valid_history_vals)
+            
+        for k in months_keys:
+            m_frac = dict_ee.get(k)
+            if m_frac is not None:
+                cov_pct = round(m_frac * 100, 2)
+                historic_coverage[k] = cov_pct if cov_pct > 0 else round(fallback_val, 2)
+            else:
+                historic_coverage[k] = round(fallback_val, 2)
+        
         result = {
             "district": request.district,
             "state": request.state,
@@ -491,7 +558,8 @@ async def get_tree_count(request: TreeCountRequest):
                 "tree_area_sqkm": tree_area_sqkm,
                 "total_district_area_sqkm": total_area_sqkm,
                 "tree_coverage_percentage": coverage_percentage,
-                "estimated_tree_population": estimated_tree_population
+                "estimated_tree_population": estimated_tree_population,
+                "historic_coverage_percentage": historic_coverage
             }
         }
         set_cached_response(cache_key, result)
