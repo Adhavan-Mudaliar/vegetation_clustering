@@ -7,6 +7,8 @@ import datetime
 import urllib.request
 import base64
 import ssl
+import os
+import json
 
 # Attempt to initialize Earth Engine
 try:
@@ -41,9 +43,35 @@ class TreeCountRequest(BaseModel):
     district: str
     state: str
 
+CACHE_DIR = "api_cache_dir"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def get_cached_response(cache_key):
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error reading cache for {cache_key}: {e}")
+    return None
+
+def set_cached_response(cache_key, data):
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Error writing cache for {cache_key}: {e}")
+
 
 @app.post("/api/fire-risk")
 async def get_fire_risk(request: FireRiskRequest):
+    cache_key = f"fire_risk_{request.district}_{request.state}".lower()
+    cached = get_cached_response(cache_key)
+    if cached:
+        return cached
+
     try:
         # Initialize GEE just in case it wasn't authenticated at startup but was authenticated later
         try:
@@ -157,10 +185,10 @@ async def get_fire_risk(request: FireRiskRequest):
                     "risk": round(props.get('FireRisk', 0), 4)
                 })
                 
-        # 7. Compute Monthly NDVI History (Past 6 Months)
-        monthly_ndvi_history = {}
+        # 7. Compute Monthly NDVI History (Past 6 Months) in one EE call
+        ee_months = []
+        months_keys = []
         for i in range(6):
-            # Calculate 30-day window for each month
             m_end = end_date - datetime.timedelta(days=i*30)
             m_start = m_end - datetime.timedelta(days=30)
             
@@ -172,37 +200,51 @@ async def get_fire_risk(request: FireRiskRequest):
             def calculate_ndvi(img):
                 return img.normalizedDifference(['B8', 'B4']).rename('NDVI')
                 
-            # Compute mean NDVI for this specific month
             month_ndvi_img = s2_month.map(calculate_ndvi).mean()
-            
-            # Reduce to scalar for the district
-            m_ndvi_val = month_ndvi_img.reduceRegion(
+            m_ndvi_dict = month_ndvi_img.reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=geom,
                 scale=1000,
                 maxPixels=1e9
-            ).getInfo().get('NDVI', 0)
+            )
             
-            # Map labels: month_1 (most recent) to month_6
-            monthly_ndvi_history[f"month_{i+1}"] = round(m_ndvi_val, 4) if m_ndvi_val is not None else 0
+            # If the entire region was masked (e.g., cloudy), NDVI will not be present in dict.
+            # Handle this gracefully.
+            m_ndvi_safe = ee.Algorithms.If(m_ndvi_dict.contains('NDVI'), m_ndvi_dict.get('NDVI'), 0)
+            ee_months.append(m_ndvi_safe)
+            months_keys.append(f"month_{6-i}") # month_6 is current month
+            
+        monthly_stats = ee.Dictionary.fromLists(months_keys, ee_months).getInfo()
+        
+        monthly_ndvi_history = {}
+        for k in months_keys:
+            val = monthly_stats.get(k)
+            monthly_ndvi_history[k] = round(val, 4) if val is not None else 0
 
         # Calculate the overall 6-month average from the monthly values
         valid_vals = [v for v in monthly_ndvi_history.values() if v is not None and v != 0]
         avg_ndvi_6_months = sum(valid_vals) / len(valid_vals) if valid_vals else 0
 
-        return {
+        result = {
             "district": request.district,
             "state": request.state,
             "high_risk_zones": results,
             "avg_ndvi_6_months": round(avg_ndvi_6_months, 4),
             "monthly_ndvi_history": monthly_ndvi_history
         }
+        set_cached_response(cache_key, result)
+        return result
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/vegetation-map")
 async def get_vegetation_map(request: VegetationMapRequest):
+    cache_key = f"veg_map_{request.district}_{request.state}".lower()
+    cached = get_cached_response(cache_key)
+    if cached:
+        return cached
+
     try:
         try:
             ee.Initialize()
@@ -238,10 +280,12 @@ async def get_vegetation_map(request: VegetationMapRequest):
         
         center_coords = geom.centroid().getInfo()['coordinates'] # [lon, lat]
         
-        # 3. Sentinel-2 NDVI Clustering (Health Focus - Full District)
+        # 3. Sentinel-2 NDVI Classification (Health Focus)
+        end_date = datetime.date.today()
+        start_date = end_date - datetime.timedelta(days=30)
         s2_col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
             .filterBounds(geom) \
-            .filterDate('2023-01-01', '2023-12-31') \
+            .filterDate(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')) \
             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) \
             .median() \
             .clip(geom)
@@ -249,15 +293,13 @@ async def get_vegetation_map(request: VegetationMapRequest):
         # Calculate NDVI: (B8 - B4) / (B8 + B4)
         ndvi = s2_col.normalizedDifference(['B8', 'B4']).rename('NDVI')
             
-        training = ndvi.sample(
-            region=geom,
-            scale=500, # Back to district scale
-            numPixels=2000
-        )
-        
-        # Use 5 clusters for health levels
-        clusterer = ee.Clusterer.wekaKMeans(5).train(training)
-        cluster_image = ndvi.cluster(clusterer)
+        # Use standard where thresholds instead of expression string
+        cluster_image = ee.Image(4) \
+            .where(ndvi.lt(0.60), 3) \
+            .where(ndvi.lt(0.40), 2) \
+            .where(ndvi.lt(0.25), 1) \
+            .where(ndvi.lt(0.15), 0) \
+            .clip(geom).rename('cluster')
         
         # Palette: Red (Poor) to Green (Excellent)
         health_palette = ['#e74c3c', '#e67e22', '#f1c40f', '#2ecc71', '#27ae60'] # Red to Dark Green
@@ -281,19 +323,18 @@ async def get_vegetation_map(request: VegetationMapRequest):
                 
         cluster_b64 = fetch_b64(cluster_thumb_url)
         
-        # 4.5 Compute Average NDVI for the district
-        avg_ndvi_stats = ndvi.reduceRegion(
+        # 4.5 & 4.7 Compute Stats server-side in one network call
+        avg_ndvi_ee_dict = ndvi.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=geom,
             scale=500,
             maxPixels=1e9
-        ).getInfo()
-        avg_ndvi = avg_ndvi_stats.get('NDVI', 0)
+        )
+        avg_ndvi_safe = ee.Algorithms.If(avg_ndvi_ee_dict.contains('NDVI'), avg_ndvi_ee_dict.get('NDVI'), 0)
         
-        # 4.7 Compute Monthly NDVI History (Past 6 Months) for Vegetation Map
-        monthly_ndvi_history = {}
-        # Re-use end_date if defined, or get current date
         history_end_date = datetime.datetime.now()
+        ee_months = []
+        months_keys = []
         for i in range(6):
             m_end = history_end_date - datetime.timedelta(days=i*30)
             m_start = m_end - datetime.timedelta(days=30)
@@ -303,16 +344,33 @@ async def get_vegetation_map(request: VegetationMapRequest):
                 .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
             
             month_ndvi_img = s2_month.map(lambda img: img.normalizedDifference(['B8', 'B4']).rename('NDVI')).mean()
-            m_ndvi_val = month_ndvi_img.reduceRegion(
+            m_ndvi_dict = month_ndvi_img.reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=geom,
                 scale=1000,
                 maxPixels=1e9
-            ).getInfo().get('NDVI', 0)
-            monthly_ndvi_history[f"month_{i+1}"] = round(m_ndvi_val, 4) if m_ndvi_val is not None else 0
+            )
+            
+            # If the entire region was masked (e.g., cloudy), NDVI will not be present in dict.
+            # Handle this gracefully.
+            m_ndvi_safe = ee.Algorithms.If(m_ndvi_dict.contains('NDVI'), m_ndvi_dict.get('NDVI'), 0)
+            ee_months.append(m_ndvi_safe)
+            months_keys.append(f"month_{6-i}") # month_6 is current
+            
+        dict_ee = ee.Dictionary.fromLists(months_keys, ee_months).set('avg_ndvi', avg_ndvi_safe)
+        all_stats = dict_ee.getInfo()
+        
+        avg_ndvi = all_stats.get('avg_ndvi')
+        if avg_ndvi is None:
+            avg_ndvi = 0
+            
+        monthly_ndvi_history = {}
+        for k in months_keys:
+            val = all_stats.get(k)
+            monthly_ndvi_history[k] = round(val, 4) if val is not None else 0
         
         # 5. Construct Response
-        return {
+        result = {
             "avg_ndvi": round(avg_ndvi, 4) if avg_ndvi is not None else 0,
             "monthly_ndvi_history": monthly_ndvi_history,
             "maps": {
@@ -335,6 +393,8 @@ async def get_vegetation_map(request: VegetationMapRequest):
             },
             "center": [center_coords[1], center_coords[0]]
         }
+        set_cached_response(cache_key, result)
+        return result
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -344,6 +404,11 @@ async def get_vegetation_map(request: VegetationMapRequest):
 
 @app.post("/api/tree-count")
 async def get_tree_count(request: TreeCountRequest):
+    cache_key = f"tree_count_{request.district}_{request.state}".lower()
+    cached = get_cached_response(cache_key)
+    if cached:
+        return cached
+
     try:
         try:
             ee.Initialize()
@@ -406,7 +471,7 @@ async def get_tree_count(request: TreeCountRequest):
         # Estimate tree population (Assuming 50,000 trees per sq km)
         estimated_tree_population = int(tree_area_sqkm * 42500)
         
-        return {
+        result = {
             "district": request.district,
             "state": request.state,
             "tree_metrics": {
@@ -416,6 +481,8 @@ async def get_tree_count(request: TreeCountRequest):
                 "estimated_tree_population": estimated_tree_population
             }
         }
+        set_cached_response(cache_key, result)
+        return result
     except Exception as e:
         import traceback
         traceback.print_exc()
