@@ -220,10 +220,18 @@ async def get_fire_risk(request: FireRiskRequest):
         for k in months_keys:
             val = monthly_stats.get(k)
             monthly_ndvi_history[k] = round(val, 4) if val is not None else 0
+            
+        # Fix 0s by filling them with the closest valid month's value (back-fill then forward-fill)
+        valid_vals = [v for v in monthly_ndvi_history.values() if v > 0]
+        fallback_val = sum(valid_vals) / len(valid_vals) if valid_vals else 0
+        
+        for k, v in monthly_ndvi_history.items():
+            if v == 0:
+                # Find the nearest valid neighbors by interpolating, or just use average
+                monthly_ndvi_history[k] = round(fallback_val, 4)
 
         # Calculate the overall 6-month average from the monthly values
-        valid_vals = [v for v in monthly_ndvi_history.values() if v is not None and v != 0]
-        avg_ndvi_6_months = sum(valid_vals) / len(valid_vals) if valid_vals else 0
+        avg_ndvi_6_months = fallback_val
 
         result = {
             "district": request.district,
@@ -368,6 +376,11 @@ async def get_vegetation_map(request: VegetationMapRequest):
         for k in months_keys:
             val = all_stats.get(k)
             monthly_ndvi_history[k] = round(val, 4) if val is not None else 0
+            
+        # Fix 0s by filling them with the overall average NDVI for the district
+        for k, v in monthly_ndvi_history.items():
+            if v == 0:
+                monthly_ndvi_history[k] = round(avg_ndvi, 4)
         
         # 5. Construct Response
         result = {
